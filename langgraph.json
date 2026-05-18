@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "polymarket_csgo_agent": "./src/agent/studio.py:graph"
+  },
+  "env": ".env"
+}

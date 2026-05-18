@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, TypedDict
 
-from langchain_ollama import ChatOllama
-from langchain_openai import ChatOpenAI
+from langchain.chat_models import init_chat_model
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
+from langgraph.graph.message import MessagesState
+
+from src.agent.langsmith_setup import configure_langsmith
 from sqlalchemy.engine import make_url
 from sqlalchemy import create_engine, text
 import requests
@@ -27,8 +32,27 @@ class AgentConfig:
     # Bonus tools
     enable_news_tool: bool = True
 
+    @classmethod
+    def from_env(cls) -> AgentConfig:
+        def getenv(name: str, default: str | None = None) -> str | None:
+            v = os.environ.get(name)
+            if v is None or v == "":
+                return default
+            return v
 
-class AgentState(TypedDict, total=False):
+        return cls(
+            neon_database_url=getenv("NEON_DATABASE_URL", "") or "",
+            llm_provider=(getenv("LLM_PROVIDER", "ollama") or "ollama").strip().lower(),
+            openai_api_key=getenv("OPENAI_API_KEY"),
+            openai_model=getenv("OPENAI_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini",
+            ollama_base_url=getenv("OLLAMA_BASE_URL", "http://localhost:11434") or "http://localhost:11434",
+            ollama_model=getenv("OLLAMA_MODEL", "deepseek-coder:6.7b") or "deepseek-coder:6.7b",
+            enable_news_tool=True,
+        )
+
+
+class AgentState(MessagesState, total=False):
+    """Hereda `messages` de MessagesState para habilitar Chat en LangSmith Studio."""
     question: str
     sql: str
     rows: list[dict[str, Any]]
@@ -38,6 +62,48 @@ class AgentState(TypedDict, total=False):
     news_error: str
     news_only: bool
     chitchat_only: bool
+
+
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+            elif isinstance(block, str):
+                parts.append(block)
+        return " ".join(parts).strip()
+    return str(content or "").strip()
+
+
+def _last_human_text(messages: list[Any] | None) -> str:
+    for m in reversed(messages or []):
+        if isinstance(m, HumanMessage):
+            return _message_text(m.content)
+        if isinstance(m, BaseMessage) and m.type == "human":
+            return _message_text(m.content)
+        if isinstance(m, dict):
+            role = str(m.get("type") or m.get("role") or "").lower()
+            if role in ("human", "user"):
+                return _message_text(m.get("content"))
+    return ""
+
+
+def _question_from_state(state: AgentState) -> str:
+    q = str(state.get("question") or "").strip()
+    if q:
+        return q
+    return _last_human_text(state.get("messages"))
+
+
+def _with_assistant_reply(state: AgentState, answer: str) -> AgentState:
+    text = (answer or "").strip()
+    state["answer"] = text
+    if text:
+        state["messages"] = [AIMessage(content=text)]
+    return state
 
 
 def _clean_sql(raw: str) -> str:
@@ -60,7 +126,9 @@ def _clean_sql(raw: str) -> str:
 
 
 def _is_active_markets_question(question: str) -> bool:
-    """Preguntas tipo enunciado: mercados más activos / actividad actual."""
+    """Preguntas tipo enunciado: mercados más activos / actividad actual (no ranking por volumen)."""
+    if _is_volume_question(question):
+        return False
     ql = (question or "").lower()
     return bool(
         re.search(
@@ -87,13 +155,74 @@ def _format_active_markets_answer(rows: list[dict[str, Any]], *, limit: int = 15
     return "\n".join(lines)
 
 
+def _is_liquidity_question(question: str) -> bool:
+    ql = (question or "").lower()
+    return bool(re.search(r"\bliquidez\b|\bliquidity\b", ql))
+
+
 def _is_liquidity_change_question(question: str) -> bool:
     ql = (question or "").lower()
     return bool(
-        re.search(r"liquidez|liquidity", ql)
+        _is_liquidity_question(question)
         and re.search(r"cambio|change", ql)
         and re.search(r"24|últim|ultim|semana|7", ql)
     )
+
+
+def _is_liquidity_rank_question(question: str) -> bool:
+    """Mayor liquidez / top N (no pregunta de Δ en ventana temporal)."""
+    if not _is_liquidity_question(question):
+        return False
+    if _is_liquidity_change_question(question):
+        return False
+    ql = (question or "").lower()
+    return bool(
+        re.search(r"\bmás\b|\bmas\b|\bmayor\b|\btop\b|top\d+|\bcuál\b|\bcual\b|\bprimeros\b", ql)
+    )
+
+
+def _sql_top_liquidity_latest(*, limit: int, active_only: bool) -> str:
+    active_clause = "and m.active is true" if active_only else ""
+    return f"""
+        with latest as (
+          select distinct on (f.market_id)
+                 f.market_id,
+                 f.liquidity as liquidity_latest,
+                 f.snapshot_ts
+          from polymarket.fact_market_snapshot f
+          join polymarket.dim_market m on m.market_id = f.market_id
+          where f.liquidity is not null
+            and f.liquidity::text <> 'NaN'
+            {active_clause}
+          order by f.market_id, f.snapshot_ts desc
+        )
+        select coalesce(m.title, m.question, m.market_id) as title,
+               l.liquidity_latest,
+               l.snapshot_ts
+        from latest l
+        join polymarket.dim_market m using (market_id)
+        order by l.liquidity_latest desc nulls last
+        limit {int(limit)};
+    """.strip()
+
+
+def _format_liquidity_rank_answer(
+    rows: list[dict[str, Any]], *, limit: int = 10, singular: bool = False
+) -> str:
+    if singular and rows:
+        r = rows[0]
+        title = r.get("title") or r.get("question") or r.get("market_id")
+        liq = r.get("liquidity_latest") or r.get("liquidity")
+        return f"Mercado activo con mayor liquidez (último snapshot): {title} — liquidez: {liq}"
+    lines: list[str] = ["Top mercados por liquidez (último snapshot):"]
+    for i, r in enumerate(rows[:limit], start=1):
+        title = r.get("title") or r.get("question") or r.get("market_id")
+        liq = r.get("liquidity_latest") or r.get("liquidity")
+        if liq is not None:
+            lines.append(f"{i}. {title} — liquidez: {liq}")
+        else:
+            lines.append(f"{i}. {title}")
+    return "\n".join(lines)
 
 
 def _format_liquidity_change_answer(rows: list[dict[str, Any]], *, limit: int = 10) -> str:
@@ -116,19 +245,110 @@ def _is_volume_question(question: str) -> bool:
     return bool(re.search(r"\bvolumen\b|\bvolume\b", ql))
 
 
+def _parse_top_limit(question: str, *, default: int = 10) -> int:
+    ql = (question or "").lower().replace(" ", "")
+    m = re.search(r"top(\d+)", ql)
+    if m:
+        return min(int(m.group(1)), 50)
+    m = re.search(r"\btop\s*(\d+)\b", (question or "").lower())
+    if m:
+        return min(int(m.group(1)), 50)
+    m = re.search(r"\b(\d+)\s*(primeros|mayores)\b", (question or "").lower())
+    if m:
+        return min(int(m.group(1)), 50)
+    return default
+
+
+def _question_wants_active_filter(question: str) -> bool:
+    ql = (question or "").lower()
+    return bool(
+        re.search(
+            r"\b(en\s+)?activo[s]?\b|\bmercados?\s+activo[s]?\b|\bactive\b",
+            ql,
+        )
+    )
+
+
+def _question_specifies_time_window(question: str) -> bool:
+    ql = (question or "").lower()
+    return bool(re.search(r"24\s*h|últim|ultim|semana|7\s*d|\b7\b|\besta\s+semana\b", ql))
+
+
+def _is_volume_rank_question(question: str) -> bool:
+    if not _is_volume_question(question):
+        return False
+    ql = (question or "").lower()
+    return bool(
+        re.search(r"\btop\b|top\d+|\bmás\b|\bmas\b|\bmayor\b|\bprimeros\b", ql)
+    )
+
+
+def _sql_top_volume_latest(*, limit: int, active_only: bool) -> str:
+    active_clause = "and m.active is true" if active_only else ""
+    return f"""
+        with latest as (
+          select distinct on (f.market_id)
+                 f.market_id,
+                 f.volume as volume_latest,
+                 f.snapshot_ts
+          from polymarket.fact_market_snapshot f
+          join polymarket.dim_market m on m.market_id = f.market_id
+          where f.volume is not null
+            and f.volume::text <> 'NaN'
+            {active_clause}
+          order by f.market_id, f.snapshot_ts desc
+        )
+        select coalesce(m.title, m.question, m.market_id) as title,
+               l.volume_latest,
+               l.snapshot_ts
+        from latest l
+        join polymarket.dim_market m using (market_id)
+        order by l.volume_latest desc nulls last
+        limit {int(limit)};
+    """.strip()
+
+
 def _format_volume_answer(rows: list[dict[str, Any]], *, limit: int = 10) -> str:
-    lines: list[str] = ["Top mercados por volumen (aprox. en la ventana solicitada):"]
+    lines: list[str] = ["Top mercados por volumen:"]
     for i, r in enumerate(rows[:limit], start=1):
         title = r.get("title") or r.get("question") or r.get("market_id")
-        v = r.get("volume_24h") or r.get("volume_7d") or r.get("volume_change") or r.get("volume")
-        latest = r.get("volume_latest")
-        if v is not None and latest is not None:
-            lines.append(f"{i}. {title} — Δvolumen: {v} (último: {latest})")
-        elif v is not None:
-            lines.append(f"{i}. {title} — Δvolumen: {v}")
+        delta = r.get("volume_24h") or r.get("volume_7d") or r.get("volume_change")
+        latest = r.get("volume_latest") or r.get("volume")
+        try:
+            delta_num = float(delta) if delta is not None else None
+        except (TypeError, ValueError):
+            delta_num = None
+        if delta_num is not None and delta_num != 0 and latest is not None:
+            lines.append(f"{i}. {title} — Δvolumen: {delta} (acumulado: {latest})")
+        elif latest is not None:
+            lines.append(f"{i}. {title} — volumen acumulado: {latest}")
+        elif delta is not None:
+            lines.append(f"{i}. {title} — Δvolumen: {delta}")
         else:
             lines.append(f"{i}. {title}")
     return "\n".join(lines)
+
+
+def _prefer_template_sql(question: str) -> bool:
+    """Usa plantillas SQL probadas en lugar del LLM para preguntas frecuentes del demo."""
+    if _is_chitchat_question(question) or _is_news_only_question(question):
+        return False
+    if not _fallback_sql(question):
+        return False
+    if _is_active_markets_question(question):
+        return True
+    if _is_volume_rank_question(question):
+        return True
+    if _is_liquidity_change_question(question):
+        return True
+    if _is_liquidity_rank_question(question):
+        return True
+    q = (question or "").lower()
+    if _is_volume_question(question) and _question_specifies_time_window(question):
+        return True
+    if ("probabilidad" in q or "prob" in q) and _question_specifies_time_window(question):
+        return True
+    return False
 
 
 _DATA_INTENT_RE = re.compile(
@@ -224,8 +444,39 @@ def _is_safe_select(sql: str) -> bool:
     return not any(re.search(rf"\\b{kw}\\b", s) for kw in banned)
 
 
+def _reset_turn_fields(state: AgentState) -> None:
+    """Limpia restos del turno anterior (crítico en Studio Chat multi-mensaje)."""
+    state["chitchat_only"] = False
+    state["news_only"] = False
+    state["sql"] = ""
+    state["rows"] = []
+    state["news"] = []
+    state["answer"] = ""
+    state["error"] = None
+    state["news_error"] = None
+
+
 def _fallback_sql(question: str) -> str | None:
     q = (question or "").lower()
+    limit = _parse_top_limit(question, default=10)
+
+    # Mayor liquidez actual (activo o top N), sin pedir "cambio".
+    if _is_liquidity_rank_question(question) and not _question_specifies_time_window(question):
+        active = _question_wants_active_filter(question) or bool(
+            re.search(r"\bmercado\s+activo\b|\bactivo[s]?\b", q)
+        )
+        lim = 1 if re.search(r"\bcuál\b|\bcual\b|\bmercado\b", q) and "top" not in q.replace(" ", "") else limit
+        return _sql_top_liquidity_latest(limit=lim, active_only=active)
+
+    # Top volumen en mercados activos: volumen acumulado del último snapshot (no Δ con 1–2 horas).
+    if _is_volume_rank_question(question) and _question_wants_active_filter(question):
+        if not _question_specifies_time_window(question):
+            return _sql_top_volume_latest(limit=limit, active_only=True)
+
+    # Top / mayor volumen sin ventana explícita → último volumen acumulado.
+    if _is_volume_rank_question(question) and not _question_specifies_time_window(question):
+        return _sql_top_volume_latest(limit=limit, active_only=_question_wants_active_filter(question))
+
     if "volumen" in q and ("24" in q or "últim" in q or "ultim" in q):
         return """
         with w as (
@@ -248,30 +499,6 @@ def _fallback_sql(question: str) -> str | None:
         join polymarket.dim_market m using (market_id)
         order by volume_24h desc nulls last
         limit 5;
-        """.strip()
-    # Si el usuario pide "más volumen" pero NO especifica ventana, asumimos 24h por defecto (demo).
-    if "volumen" in q and ("más" in q or "mas" in q) and not re.search(r"24|últim|ultim|semana|7", q):
-        return """
-        with w as (
-          select *
-          from polymarket.fact_market_snapshot
-          where snapshot_ts >= (now() - interval '24 hours')
-        ),
-        agg as (
-          select market_id,
-                 max(volume) as max_volume,
-                 min(volume) as min_volume
-          from w
-          where volume is not null and volume::text <> 'NaN'
-          group by market_id
-        )
-        select coalesce(m.title, m.question, m.market_id) as title,
-               (agg.max_volume - agg.min_volume) as volume_24h,
-               agg.max_volume as volume_latest
-        from agg
-        join polymarket.dim_market m using (market_id)
-        order by volume_24h desc nulls last
-        limit 10;
         """.strip()
     if "volumen" in q and ("semana" in q or "7" in q):
         return """
@@ -533,20 +760,42 @@ def news_tool(*, question: str, rows: list[dict[str, Any]], max_records: int = 8
     return _filter_news_items(items, rows=rows or [], limit=int(max_records))
 
 
-def build_agent(cfg: AgentConfig):
+def _llm_content(response: Any) -> str:
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return str(content or "")
+
+
+def _make_llm(cfg: AgentConfig) -> BaseChatModel:
+    """Modelo de chat unificado (LangGraph + trazas LangSmith)."""
     provider = (cfg.llm_provider or "ollama").strip().lower()
     if provider == "openai":
         if not cfg.openai_api_key:
             raise ValueError("Falta openai_api_key para llm_provider=openai")
-        llm = ChatOpenAI(api_key=cfg.openai_api_key, model=cfg.openai_model, temperature=0)
-    elif provider == "ollama":
-        llm = ChatOllama(
+        os.environ.setdefault("OPENAI_API_KEY", cfg.openai_api_key)
+        return init_chat_model(cfg.openai_model, model_provider="openai", temperature=0)
+    if provider == "ollama":
+        return init_chat_model(
+            cfg.ollama_model,
+            model_provider="ollama",
             base_url=cfg.ollama_base_url,
-            model=cfg.ollama_model,
             temperature=0,
         )
-    else:
-        raise ValueError(f"llm_provider no soportado: {cfg.llm_provider!r}")
+    raise ValueError(f"llm_provider no soportado: {cfg.llm_provider!r}")
+
+
+def build_graph(cfg: AgentConfig):
+    configure_langsmith()
+    llm = _make_llm(cfg)
 
     # Asegura compatibilidad con SQLAlchemy usando psycopg3.
     try:
@@ -579,8 +828,17 @@ def build_agent(cfg: AgentConfig):
         "- Para 'mayor volumen en X' NO sumes volume: asume que volume es acumulado. Usa (max(volume)-min(volume)) en la ventana.\n"
     )
 
+    def ingest_node(state: AgentState) -> AgentState:
+        _reset_turn_fields(state)
+        q = _question_from_state(state)
+        if q:
+            state["question"] = q
+        return state
+
     def sql_node(state: AgentState) -> AgentState:
-        q = str(state.get("question") or "")
+        q = _question_from_state(state)
+        state["chitchat_only"] = False
+        state["news_only"] = False
         if _is_news_only_question(q):
             state["news_only"] = True
             state["sql"] = "SELECT 1 AS ok;"
@@ -589,13 +847,12 @@ def build_agent(cfg: AgentConfig):
             state["chitchat_only"] = True
             state["sql"] = ""
             return state
-        msg = llm.invoke(
-            [
-                {"role": "system", "content": system_sql},
-                {"role": "user", "content": q},
-            ]
-        )
-        sql = _clean_sql(msg.content or "")
+        fb = _fallback_sql(q)
+        if fb and _prefer_template_sql(q):
+            state["sql"] = fb
+            return state
+        msg = llm.invoke([SystemMessage(content=system_sql), HumanMessage(content=q)])
+        sql = _clean_sql(_llm_content(msg))
         if not _is_safe_select(sql):
             # fallback conservador: una consulta simple válida
             sql = "SELECT 1 AS ok;"
@@ -620,7 +877,7 @@ def build_agent(cfg: AgentConfig):
 
         sql = str(state.get("sql") or "")
         # Requisito 14: Database Tool obligatoria (aquí se usa).
-        fb = _fallback_sql(str(state.get("question") or ""))
+        fb = _fallback_sql(_question_from_state(state))
         try:
             rows = database_tool(cfg.neon_database_url, sql)
             # Si el modelo cayó en el "SELECT 1" (fallback conservador), preferimos el fallback específico.
@@ -632,6 +889,27 @@ def build_agent(cfg: AgentConfig):
             if (not rows) and fb and _clean_sql(sql) != _clean_sql(fb):
                 rows = database_tool(cfg.neon_database_url, fb)
                 state["sql"] = fb
+            # SQL del LLM con filas vacías o ranking de volumen pobre → plantilla robusta.
+            q_exec = _question_from_state(state)
+            if fb and _prefer_template_sql(q_exec):
+                weak_volume = _is_volume_rank_question(q_exec) and (
+                    not rows
+                    or all(
+                        float(r.get("volume_24h") or r.get("volume_7d") or 0) == 0
+                        for r in rows
+                        if isinstance(r, dict)
+                    )
+                )
+                weak_liquidity = _is_liquidity_rank_question(q_exec) and not rows
+                if weak_volume or weak_liquidity or (
+                    not rows and _clean_sql(sql) != _clean_sql(fb)
+                ):
+                    rows = database_tool(cfg.neon_database_url, fb)
+                    state["sql"] = fb
+                elif _clean_sql(sql) != _clean_sql(fb):
+                    # Plantilla conocida: no confiar en SQL alucinado del LLM si ya hay filas raras.
+                    rows = database_tool(cfg.neon_database_url, fb)
+                    state["sql"] = fb
             state["rows"] = rows
         except Exception as e:  # noqa: BLE001
             if fb:
@@ -653,12 +931,12 @@ def build_agent(cfg: AgentConfig):
             return state
         if not cfg.enable_news_tool:
             return state
-        q = str(state.get("question") or "").strip().lower()
+        q = _question_from_state(state).strip().lower()
         # Solo si el usuario pide noticias (para no ralentizar el flujo normal).
         if "noticia" in q or "news" in q or "hltv" in q:
             try:
                 state["news"] = news_tool(
-                    question=str(state.get("question") or ""),
+                    question=_question_from_state(state),
                     rows=state.get("rows") or [],
                     max_records=8,
                 )
@@ -684,69 +962,108 @@ def build_agent(cfg: AgentConfig):
         "- Si NEWS está vacío o hay news_error, di que no se pudieron cargar ahora y sugiere reintentar.\n"
     )
     def answer_node(state: AgentState) -> AgentState:
-        q = str(state.get("question") or "")
+        q = _question_from_state(state)
         sql = str(state.get("sql") or "")
         rows = state.get("rows") or []
         news = state.get("news") or []
-        preview = rows[:10] if isinstance(rows, list) else rows
+        err = state.get("error")
         if state.get("chitchat_only"):
-            state["answer"] = _chitchat_reply(q)
-            return state
+            return _with_assistant_reply(state, _chitchat_reply(q))
         if state.get("news_only"):
             msg = llm.invoke(
                 [
-                    {"role": "system", "content": system_answer_news_only},
-                    {
-                        "role": "user",
-                        "content": (
+                    SystemMessage(content=system_answer_news_only),
+                    HumanMessage(
+                        content=(
                             f"Pregunta: {q}\n"
                             f"NEWS: {news}\n"
                             f"news_error: {state.get('news_error', '')}\n"
-                        ),
-                    },
+                        )
+                    ),
                 ]
             )
-            state["answer"] = (msg.content or "").strip()
-            return state
-        # Demo estable: lista legible sin depender del LLM para esta pregunta del enunciado.
+            return _with_assistant_reply(state, _llm_content(msg).strip())
+        if err:
+            return _with_assistant_reply(
+                state,
+                f"No pude consultar Neon: {err}. Comprueba NEON_DATABASE_URL y que el DAG haya cargado datos.",
+            )
+        if isinstance(rows, list) and not rows:
+            return _with_assistant_reply(
+                state,
+                "No hay filas para esta pregunta en el data warehouse. "
+                "Ejecuta el pipeline (Airflow) y vuelve a intentar.",
+            )
+        # Respuestas deterministas (sin LLM) para el demo y Studio Chat.
         if _is_active_markets_question(q) and isinstance(rows, list) and rows:
-            state["answer"] = _format_active_markets_answer(rows)
-            return state
-        # Demo estable: evita respuestas tipo "no puedo ejecutar SQL" cuando ya tenemos filas.
+            return _with_assistant_reply(state, _format_active_markets_answer(rows))
         if _is_liquidity_change_question(q) and isinstance(rows, list) and rows:
-            state["answer"] = _format_liquidity_change_answer(rows)
-            return state
+            return _with_assistant_reply(state, _format_liquidity_change_answer(rows))
+        if _is_liquidity_rank_question(q) and isinstance(rows, list) and rows:
+            singular = bool(
+                re.search(r"\bcuál\b|\bcual\b", q.lower())
+                and "top" not in q.lower().replace(" ", "")
+            )
+            return _with_assistant_reply(
+                state,
+                _format_liquidity_rank_answer(
+                    rows,
+                    limit=_parse_top_limit(q, default=10),
+                    singular=singular,
+                ),
+            )
         if _is_volume_question(q) and isinstance(rows, list) and rows:
-            state["answer"] = _format_volume_answer(rows)
-            return state
+            return _with_assistant_reply(
+                state, _format_volume_answer(rows, limit=_parse_top_limit(q, default=10))
+            )
+        if _prefer_template_sql(q) and isinstance(rows, list) and rows:
+            if rows[0].get("prob_change_24h") is not None:
+                lines = ["Top cambios de probabilidad (24h):"]
+                for i, r in enumerate(rows[:10], start=1):
+                    lines.append(
+                        f"{i}. {r.get('title')} — {r.get('outcome_label')}: Δ={r.get('prob_change_24h')}"
+                    )
+                return _with_assistant_reply(state, "\n".join(lines))
+            if rows[0].get("liquidity_change_24h") is not None or rows[0].get("liquidity_change_7d") is not None:
+                return _with_assistant_reply(state, _format_liquidity_change_answer(rows))
+            if rows[0].get("volume_24h") is not None or rows[0].get("volume_7d") is not None:
+                return _with_assistant_reply(
+                    state, _format_volume_answer(rows, limit=_parse_top_limit(q, default=10))
+                )
+        preview = rows[:10] if isinstance(rows, list) else rows
         msg = llm.invoke(
             [
-                {"role": "system", "content": system_answer},
-                {
-                    "role": "user",
-                    "content": (
+                SystemMessage(content=system_answer),
+                HumanMessage(
+                    content=(
                         f"Pregunta: {q}\n"
                         f"SQL: {sql}\n"
                         f"Filas_count: {len(rows) if isinstance(rows, list) else 'n/a'}\n"
                         f"Filas_preview: {preview}\n"
                         f"NEWS: {news}"
-                    ),
-                },
+                    )
+                ),
             ]
         )
-        state["answer"] = (msg.content or "").strip()
-        return state
+        return _with_assistant_reply(state, _llm_content(msg).strip())
 
-    # Nota: con LangGraph 0.2+, usar TypedDict evita que invoke() devuelva None.
+    # Grafo LangGraph (StateGraph + nodos); TypedDict evita invoke() -> None.
     g = StateGraph(AgentState)
+    g.add_node("ingest", ingest_node)
     g.add_node("sql", sql_node)
     g.add_node("exec", exec_node)
     g.add_node("news", news_node)
     g.add_node("answer", answer_node)
-    g.set_entry_point("sql")
+    g.set_entry_point("ingest")
+    g.add_edge("ingest", "sql")
     g.add_edge("sql", "exec")
     g.add_edge("exec", "news")
     g.add_edge("news", "answer")
     g.add_edge("answer", END)
     return g.compile()
+
+
+def build_agent(cfg: AgentConfig):
+    """Alias retrocompatible (Streamlit / imports antiguos)."""
+    return build_graph(cfg)
 

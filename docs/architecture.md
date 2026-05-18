@@ -6,7 +6,8 @@ Requisitos cubiertos:
 - **(6)** DataLake en **Amazon S3**, datos **raw/crudos**, formato **Delta Lake**, incluye timestamp extracción
 - **(7)** **Sensor** en Airflow que espera a la llegada del raw antes de transformar/cargar
 - **(10)** DW relacional: **NeonDB (Postgres)**
-- **(13,14)** Agente AI con **LangGraph** + herramienta de **DatabaseTool** (SQL contra Neon)
+- **(13,14)** Agente AI con **LangGraph** (`StateGraph`: sql → exec → news → answer) + **DatabaseTool** (SQL contra Neon)
+- **Observabilidad:** trazas opcionales en **LangSmith** al usar el chatbot Streamlit (`LANGSMITH_API_KEY` en `.env`)
 
 Flujo:
 

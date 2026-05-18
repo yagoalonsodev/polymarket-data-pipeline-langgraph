@@ -5,7 +5,8 @@ from pathlib import Path
 import streamlit as st
 from dotenv import find_dotenv, load_dotenv
 
-from src.agent.langgraph_agent import AgentConfig, build_agent
+from src.agent.langgraph_agent import AgentConfig, build_graph
+from src.agent.langsmith_setup import configure_langsmith
 
 # Las 3 preguntas del enunciado (Parte 2 / demo), siempre disponibles.
 DEFAULT_SAVED_QUERIES: list[str] = [
@@ -64,6 +65,8 @@ else:
 st.set_page_config(page_title="Polymarket CSGO Chatbot", layout="centered")
 st.title("Chatbot Polymarket (CSGO) · LangGraph + Neon")
 
+_langsmith_on = configure_langsmith()
+
 if "history" not in st.session_state:
     st.session_state.history = []
 if "user_saved_queries" not in st.session_state:
@@ -88,7 +91,7 @@ if llm_provider == "openai" and not openai_key:
     st.error("LLM_PROVIDER=openai pero falta `OPENAI_API_KEY` en el entorno.")
     st.stop()
 
-agent = build_agent(
+agent = build_graph(
     AgentConfig(
         neon_database_url=neon_url,
         llm_provider=llm_provider,
@@ -114,6 +117,11 @@ with st.sidebar:
             st.rerun()
 
 show_sql = st.toggle("Mostrar SQL / datos", value=True)
+if _langsmith_on:
+    st.caption(
+        "Trazas en LangSmith: [smith.langchain.com](https://smith.langchain.com) "
+        f"→ proyecto `{os.environ.get('LANGSMITH_PROJECT', 'proyecto3-polymarket-csgo')}`"
+    )
 st.caption("Bonus: si preguntas por noticias, usa HLTV (CSGO/CS2).")
 
 # Historial tipo chat
@@ -160,7 +168,13 @@ if send:
         state = {"question": q_text}
         with st.spinner("Pensando… (Ollama puede tardar un poco)"):
             try:
-                out = agent.invoke(state)
+                out = agent.invoke(
+                    state,
+                    config={
+                        "run_name": "streamlit_query",
+                        "tags": ["streamlit", "polymarket-csgo"],
+                    },
+                )
             except Exception as e:  # noqa: BLE001
                 out = {"question": q_text, "error": str(e), "answer": ""}
         if out is None:

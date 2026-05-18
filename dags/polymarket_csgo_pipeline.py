@@ -30,7 +30,7 @@ from src.dw.neon import (
     upsert_market,
     upsert_outcome,
 )
-from src.polymarket.client import PolymarketClient, filter_markets_by_keywords
+from src.polymarket.client import PolymarketClient
 from src.polymarket.snapshot import add_snapshot_metadata, snapshot_meta
 from src.transform.normalize import RawPartition, read_raw_markets_partition, snapshot_timestamp_from_partition
 
@@ -58,8 +58,11 @@ def _extract_to_s3_raw(**context) -> dict:
     meta = snapshot_meta()
     client = PolymarketClient(base_url=base_url)
 
-    markets = client.fetch_active_markets(limit=500)
-    markets = filter_markets_by_keywords(markets, keywords=keywords)
+    markets = client.fetch_active_markets_for_keywords(
+        keywords=keywords,
+        page_limit=100,
+        max_pages=101,
+    )
     markets = add_snapshot_metadata(markets, meta)
 
     s3loc = S3Location(bucket=bucket, prefix=prefix)

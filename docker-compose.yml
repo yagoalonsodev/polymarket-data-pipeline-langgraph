@@ -44,7 +44,10 @@ services:
       - ./logs:/opt/airflow/logs
       - ./config:/opt/airflow/config
     ports:
-      - "8080:8080"
+      - "8800:8080"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     healthcheck:
       # Airflow 3: /health devuelve 404; el monitor de la API v2 responde 200.
       test: ["CMD", "curl", "-f", "http://localhost:8080/api/v2/monitor/health"]
