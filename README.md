@@ -1,12 +1,27 @@
-# Proyecto Final: Data Engineering + AI Agents con Polymarket (CSGO)
+# Polymarket Data Pipeline + AI SQL Agent
 
-Este proyecto implementa:
+Proyecto de data engineering e IA que extrae datos de mercados de predicción (Polymarket/CSGO), los almacena en un Data Lake (Delta Lake + S3), los transforma y carga en un Data Warehouse relacional (NeonDB), y expone un agente conversacional basado en LangGraph para consultar los datos en SQL de forma natural desde una interfaz Streamlit.
+
+---
+
+## Qué incluye
 
 - Pipeline de datos orquestado con **Apache Airflow**
-- **DataLake en S3** con datos **RAW** en **Delta Lake**
+- **Data Lake en S3** con datos **RAW** en **Delta Lake**
 - **Sensor en Airflow** que espera la llegada del RAW antes de transformar
 - Transformaciones y carga a **Data Warehouse relacional (NeonDB/Postgres)**
 - **Agente LangGraph** + **Chatbot Streamlit** para consultas en lenguaje natural (SQL contra Neon)
+
+## Stack
+
+| Capa | Tecnología |
+|------|------------|
+| Orquestación | Apache Airflow (Docker) |
+| Data Lake | AWS S3 + Delta Lake |
+| Data Warehouse | NeonDB (PostgreSQL) |
+| Agente IA | LangGraph + LangChain |
+| UI | Streamlit |
+| Observabilidad | LangSmith (opcional) |
 
 ## Requisitos (alto nivel)
 
@@ -186,3 +201,7 @@ En **LangGraph Studio → Chat**, si un hilo antiguo repite la misma respuesta i
 - `sql/`: DDL del DW
 - `streamlit_app/`: chatbot (LangGraph + Streamlit)
 - `docs/`: arquitectura y guía de demo
+
+## Autor
+
+**Yago Alonso** — Máster en Inteligencia Artificial y Big Data, La Salle Gràcia.
